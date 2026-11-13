@@ -385,6 +385,7 @@ ok(d and d["versao"] == "3.15.0", "ciclo NOVO: se a 3.15.1 ainda nao tem instala
 ok(m.ultimo_instalador_python(None, "3.15.1", existe=lambda u: False) is None, "ciclo NOVO sem nenhum instalador -> None")
 ok("HTTP 403" in m.descrever_codigo(0x80190193) and "manualmente" in m.descrever_codigo(0x80190193), "codigo 0x80190193 = HTTP 403 explicado")
 ok("HTTP 404" in m.descrever_codigo(0x80190194) and m.falha_de_download_http(0x80190193) and not m.falha_de_download_http(0x8A150014), "familia 0x8019xxxx = HTTP")
+ok("instalador cancelou" in m.descrever_codigo(0x8A15010C) and "travou" in m.descrever_codigo(0x8A15010C), "codigo 0x8A15010C = instalador cancelou (programa aberto travou arquivo)")
 
 _rodar0 = m.rodar
 m.rodar = lambda args, timeout=300, env=None: "Encontrado X\nPágina inicial: https://exemplo.com/produto\nFornecedor: Y"
@@ -459,5 +460,268 @@ try:
 except Exception as e:
     ok(False, "endoflife falhou: %r" % e)
 
+# --- inicializacao com o Windows via tarefa elevada (nada de registro real nem schtasks real)
+import xml.etree.ElementTree as _ET
+_NS = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+_exe_dificil = 'C:\\Programas & Co\\<App>\\"app".exe'
+_usr_dificil = 'DOM\\Gi&an <x> "y"'
+try:
+    _raiz = _ET.fromstring(m.xml_tarefa_inicio(_exe_dificil, "--minimizado", _usr_dificil))
+    ok(_raiz.tag.endswith("Task"), "xml_tarefa_inicio: XML faz parse (raiz Task)")
+    ok(_raiz.find(".//t:Principal/t:RunLevel", _NS).text == "HighestAvailable", "xml_tarefa_inicio: RunLevel HighestAvailable")
+    ok(_raiz.find(".//t:Triggers/t:LogonTrigger", _NS) is not None, "xml_tarefa_inicio: LogonTrigger presente")
+    ok(_raiz.find(".//t:LogonTrigger/t:UserId", _NS).text == _usr_dificil, "xml_tarefa_inicio: usuario com & < > aspas escapado (le de volta igual)")
+    ok(_raiz.find(".//t:Exec/t:Command", _NS).text == _exe_dificil, "xml_tarefa_inicio: caminho com & < > aspas escapado (le de volta igual)")
+    ok(_raiz.find(".//t:Exec/t:Arguments", _NS).text == "--minimizado", "xml_tarefa_inicio: argumento --minimizado")
+except Exception as e:
+    ok(False, "xml_tarefa_inicio: excecao %r" % e)
+
+_chamadas = {"schtasks": [], "run": []}
+_orig = {k: getattr(m, k) for k in ("_schtasks", "_run_key_definir", "eh_admin", "tarefa_inicio_existe", "_criar_tarefa_inicio")}
+_tinha_frozen = hasattr(sys, "frozen")
+def _preparar(admin, frozen, criar_ok=False):
+    _chamadas["schtasks"].clear(); _chamadas["run"].clear()
+    m._schtasks = lambda args, timeout=30: (_chamadas["schtasks"].append(list(args)) or 0)
+    m._run_key_definir = lambda ativo: (_chamadas["run"].append(ativo) or True)
+    m.eh_admin = lambda: admin
+    m.tarefa_inicio_existe = lambda: False
+    m._criar_tarefa_inicio = lambda: criar_ok
+    if frozen:
+        sys.frozen = True
+    elif _tinha_frozen is False and hasattr(sys, "frozen"):
+        del sys.frozen
+try:
+    _preparar(admin=False, frozen=False)                       # .py sem admin
+    r = m.definir_iniciar_com_windows(True)
+    ok(_chamadas["schtasks"] == [], "iniciar com Windows, .py sem admin: NAO chama schtasks")
+    ok(_chamadas["run"] == [True], "iniciar com Windows, .py sem admin: cai na chave Run (ativo=True)")
+    ok(r is True, "iniciar com Windows, .py sem admin: retorna sucesso")
+    _preparar(admin=True, frozen=False)                        # admin mas .py: nao cria tarefa de verdade
+    m._criar_orig = _orig["_criar_tarefa_inicio"]
+    m._criar_tarefa_inicio = _orig["_criar_tarefa_inicio"]     # usa a funcao real: ela recusa (sem frozen)
+    m.definir_iniciar_com_windows(True)
+    ok(_chamadas["schtasks"] == [], "iniciar com Windows, admin mas .py (sem frozen): NAO chama schtasks")
+    _preparar(admin=False, frozen=True)                        # .exe sem admin
+    m.definir_iniciar_com_windows(True)
+    ok(_chamadas["schtasks"] == [] and _chamadas["run"] == [True], "iniciar com Windows, .exe sem admin: usa Run, sem schtasks")
+    _preparar(admin=True, frozen=True, criar_ok=True)           # .exe admin: tarefa criada (mock) -> apaga Run
+    m.definir_iniciar_com_windows(True)
+    ok(_chamadas["run"] == [False], "iniciar com Windows, .exe admin: tarefa criada e chave Run removida (sem duplicar)")
+    _preparar(admin=False, frozen=False)
+    m.definir_iniciar_com_windows(False)
+    ok(_chamadas["run"] == [False], "desligar: limpa a chave Run")
+finally:
+    for k, v in _orig.items():
+        setattr(m, k, v)
+    if _tinha_frozen is False and hasattr(sys, "frozen"):
+        del sys.frozen
+
+# --- fechar programa a forca (0x8A15010C): termos, escolha de processos, pergunta/encerramento simulados
+from types import SimpleNamespace as _NS
+import threading as _thr
+ok(m.termos_do_item({"nome": "Ollama version 0.40.13", "id": "Ollama.Ollama"}) == {"ollama"},
+   "termos_do_item: Ollama -> so 'ollama' (descarta 'version' e numeros)")
+ok("microsoft" not in m.termos_do_item({"nome": "Microsoft Teams", "id": "Microsoft.Teams"}),
+   "termos_do_item: descarta 'microsoft'")
+ok(m.termos_do_item({"nome": "Microsoft Teams", "id": "Microsoft.Teams"}) == {"teams"},
+   "termos_do_item: Microsoft Teams -> {'teams'}")
+ok(m.termos_do_item({"nome": "Programa 2024 1.2", "id": "X.Programa"}) == {"programa"},
+   "termos_do_item: descarta numeros (2024, 1.2)")
+ok(m.termos_do_item({}) == set() and m.termos_do_item({"nome": None}) == set(),
+   "termos_do_item: item vazio/None nao levanta erro")
+
+_OLL = r"C:\Users\Gian\AppData\Local\Programs\Ollama"
+_WIN = os.environ.get("SystemRoot", r"C:\Windows")
+_T = m.termos_do_item({"nome": "Ollama version 0.40.13", "id": "Ollama.Ollama"})
+ollama_procs = [
+    {"ProcessId": 100, "Name": "ollama.exe", "ExecutablePath": _OLL + r"\ollama.exe"},
+    {"ProcessId": 200, "Name": "ollama app.exe", "ExecutablePath": _OLL + r"\ollama app.exe"},
+]
+mistura = ollama_procs + [
+    {"ProcessId": 300, "Name": "ollama.exe", "ExecutablePath": _WIN + r"\System32\ollama.exe"},
+    {"ProcessId": os.getpid(), "Name": "ollama.exe", "ExecutablePath": _OLL + r"\ollama.exe"},
+    {"ProcessId": 400, "Name": "explorer.exe", "ExecutablePath": _WIN + r"\explorer.exe"},
+    {"ProcessId": 401, "Name": "svchost.exe", "ExecutablePath": _WIN + r"\System32\svchost.exe"},
+    {"ProcessId": 402, "Name": "python.exe", "ExecutablePath": r"C:\Python313\python.exe"},
+    {"ProcessId": 403, "Name": "powershell.exe", "ExecutablePath": _WIN + r"\System32\WindowsPowerShell\v1.0\powershell.exe"},
+]
+r1 = m.escolher_processos(ollama_procs, _T, 999, "")
+ok(sorted(p["pid"] for p in r1) == [100, 200],
+   "escolher: Ollama pega ollama.exe e 'ollama app.exe' em Programs\\Ollama")
+r2 = m.escolher_processos(mistura, _T | {"explorer", "svchost", "python", "powershell"}, os.getpid(), "")
+ok(sorted(p["pid"] for p in r2) == [100, 200],
+   "escolher: nao pega PID proprio, C:\\Windows, explorer/svchost/python/powershell (mesmo com termo casando)")
+r3 = m.escolher_processos(ollama_procs, _T, 999, _OLL + r"\ollama app.exe")
+ok(sorted(p["pid"] for p in r3) == [100], "escolher: nao pega o proprio exe (meu_exe)")
+ok(m.escolher_processos(None, _T, 1) == [] and m.escolher_processos([], _T, 1) == [],
+   "escolher: lista vazia/None nao levanta erro")
+lixo = [None, {}, "lixo", 5, {"ProcessId": "abc", "Name": "ollama.exe", "ExecutablePath": "C:\\x\\ollama.exe"},
+        {"ProcessId": None, "Name": "ollama.exe", "ExecutablePath": "C:\\x\\ollama.exe"},
+        {"ProcessId": 7, "Name": None, "ExecutablePath": "C:\\x"},
+        {"ProcessId": 8, "Name": "ollama.exe", "ExecutablePath": None}]
+try:
+    ok(m.escolher_processos(lixo, _T, 1) == [], "escolher: entradas malformadas ignoradas sem erro")
+except Exception as e:
+    ok(False, f"escolher: entradas malformadas levantaram {e!r}")
+gitp = [{"ProcessId": 1, "Name": "git.exe", "ExecutablePath": r"C:\Program Files\Git\git.exe"},
+        {"ProcessId": 2, "Name": "gitkraken.exe", "ExecutablePath": r"C:\Program Files\GitKraken\gitkraken.exe"}]
+ok([p["pid"] for p in m.escolher_processos(gitp, {"git"}, 9, "")] == [1],
+   "termo curto (<6) so casa nome exato: 'git' sim, 'gitkraken' nao")
+
+class _EvFalso:
+    def set(self): pass
+    def wait(self, t=None): return False     # simula o tempo esgotado sem esperar de verdade
+
+class _FilaSim:
+    def __init__(self, resposta=None, nao_responde=False):
+        self.resposta, self.nao, self.perguntas = resposta, nao_responde, []
+    def put(self, msg):
+        tipo, dado = msg
+        if tipo == "fechar_pergunta":
+            texto, evento, resp = dado
+            self.perguntas.append(texto)
+            if not self.nao and self.resposta is not None:
+                resp.append(self.resposta)
+                evento.set()
+
+_orig_lp, _orig_ep, _orig_time, _orig_thr = m.listar_processos, m.encerrar_processos, m.time, m.threading
+
+def _sim_fechar(lista, resposta=True, n_ok=None, falha_listar=False, timeout=False):
+    enc, logs = [], []
+    def _quebra():
+        raise RuntimeError("simulado")
+    sv = _NS(fila=_FilaSim(resposta, nao_responde=timeout))
+    m.listar_processos = _quebra if falha_listar else (lambda: lista)
+    m.encerrar_processos = lambda pids: (enc.append(list(pids)) or (len(pids) if n_ok is None else n_ok))
+    m.time = _NS(sleep=lambda s: None)
+    m.threading = _NS(Event=_EvFalso if timeout else _thr.Event)
+    try:
+        r = m.App._fechar_para_atualizar(sv, {"nome": "Ollama", "id": "Ollama.Ollama"}, logs.append)
+    finally:
+        m.listar_processos, m.encerrar_processos = _orig_lp, _orig_ep
+        m.time, m.threading = _orig_time, _orig_thr
+    return r, enc, sv.fila
+
+r, enc, fila = _sim_fechar(ollama_procs, resposta=True)
+ok(r is True and enc == [[100, 200]] and len(fila.perguntas) == 1,
+   "fechar: resposta SIM -> encerra Ollama (100, 200) e devolve True")
+r, enc, fila = _sim_fechar(ollama_procs, resposta=False)
+ok(r is False and enc == [] and len(fila.perguntas) == 1, "fechar: resposta NAO -> nao encerra, devolve False")
+r, enc, fila = _sim_fechar([], resposta=True)
+ok(r is False and enc == [] and fila.perguntas == [], "fechar: sem processos -> False, sem pergunta, nada encerrado")
+r, enc, fila = _sim_fechar(ollama_procs, timeout=True)
+ok(r is False and enc == [], "fechar: sem resposta (timeout simulado) -> False, nada encerrado")
+r, enc, fila = _sim_fechar(ollama_procs, resposta=True, n_ok=0)
+ok(r is False and enc == [[100, 200]], "fechar: taskkill recusou tudo (0 ok) -> False")
+r, enc, fila = _sim_fechar(None, resposta=True, falha_listar=True)
+ok(r is False and enc == [], "fechar: erro ao listar processos -> False, sem levantar")
+
+# --- travadores por arquivo (log do Inno) + filtro + _fechar_para_atualizar com processos_com_arquivo simulado
+_TMP = tempfile.mkdtemp()
+def _grava_log(nome, texto):
+    p = os.path.join(_TMP, nome)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(texto)
+    return p
+_DLL = r"C:\Users\Gian\AppData\Local\Programs\Ollama\lib\ollama.dll"
+_DLL_ANTIGO = r"C:\Users\Gian\AppData\Local\Programs\Ollama\lib\antigo.dll"
+_log_mesma = _grava_log("inno_mesma_linha.log", "\n".join([
+    "2026-11-03 10:00:00.1 Dest filename: " + _DLL_ANTIGO,
+    "2026-11-03 10:00:01.2 Dest filename: " + _DLL,
+    "2026-11-03 10:00:02.3 Error: could not replace, appears to be in use",
+]) + "\n")
+_log_linha_seguinte = _grava_log("inno_proxima_linha.log", "\n".join([
+    "Dest filename:", _DLL, "Error: appears to be in use",
+]) + "\n")
+_log_sem_marcador = _grava_log("inno_sem_marcador.log", "Dest filename: " + _DLL + "\nTudo certo, instalado.\n")
+_MARCA_PT = "O registro do instalador est\u00e1 dispon\u00edvel em: "
+ok(m.arquivo_travado_no_log(_MARCA_PT + _log_mesma) == _DLL,
+   "arquivo_travado_no_log: pega o ULTIMO Dest filename antes do 'appears to be in use' (valor na mesma linha)")
+ok(m.arquivo_travado_no_log("installer log is available at: " + _log_linha_seguinte) == _DLL,
+   "arquivo_travado_no_log: valor do Dest filename na linha seguinte")
+ok(m.arquivo_travado_no_log(_MARCA_PT + _log_sem_marcador) == "",
+   "arquivo_travado_no_log: log sem 'appears to be in use' -> ''")
+ok(m.arquivo_travado_no_log(_MARCA_PT + os.path.join(_TMP, "nao_existe.log")) == "",
+   "arquivo_travado_no_log: caminho de log inexistente -> ''")
+ok(all(m.arquivo_travado_no_log(t) == "" for t in ["", "lixo qualquer", None]),
+   "arquivo_travado_no_log: texto sem marcador (vazio, lixo, None) -> ''")
+
+_TRAV_PY = {"ProcessId": 10, "Name": "python.exe",
+            "ExecutablePath": r"C:\Users\Gian\AppData\Local\Programs\Python\Python313\python.exe",
+            "CommandLine": r"python.exe C:\Users\Gian\openjarvis\main.py"}
+_WIN = os.environ.get("SystemRoot", r"C:\Windows")
+_lista_trav = [
+    _TRAV_PY,
+    {"ProcessId": os.getpid(), "Name": "python.exe", "ExecutablePath": r"C:\Python313\python.exe", "CommandLine": "eu"},
+    {"ProcessId": 20, "Name": "ollama.exe", "ExecutablePath": _WIN + r"\System32\ollama.exe"},
+    {"ProcessId": 30, "Name": "explorer.exe", "ExecutablePath": _WIN + r"\explorer.exe"},
+    {"ProcessId": 31, "Name": "svchost.exe", "ExecutablePath": _WIN + r"\System32\svchost.exe"},
+    {"ProcessId": 32, "Name": "cmd.exe", "ExecutablePath": _WIN + r"\System32\cmd.exe"},
+    {"ProcessId": 33, "Name": "powershell.exe", "ExecutablePath": _WIN + r"\System32\powershell.exe"},
+    {"ProcessId": 40, "Name": "ollama app.exe", "ExecutablePath": r"C:\Users\Gian\AppData\Local\Programs\Ollama\ollama app.exe"},
+    None, "lixo", {"ProcessId": "x", "Name": "python.exe"}, {"ProcessId": None, "Name": "python.exe"},
+]
+_f = m.filtrar_travadores(_lista_trav, os.getpid())
+ok(sorted(p["pid"] for p in _f) == [10, 40],
+   "filtrar_travadores: mantem python.exe e 'ollama app.exe'; tira PID proprio, C:Windows, explorer/svchost/cmd/powershell, malformadas e None")
+ok(next(p for p in _f if p["pid"] == 10)["linha"] == r"python.exe C:\Users\Gian\openjarvis\main.py",
+   "filtrar_travadores: guarda a linha de comando do travador")
+ok(m.filtrar_travadores(None, 1) == [], "filtrar_travadores: lista None -> []")
+
+_orig_pca = m.processos_com_arquivo
+def _sim_travador(saida, resposta=True, travadores=None, listar=None):
+    chamadas, enc = [], []
+    def _pca(caminho):
+        chamadas.append(caminho)
+        return list(travadores or [])
+    sv = _NS(fila=_FilaSim(resposta))
+    m.processos_com_arquivo = _pca
+    m.listar_processos = lambda: list(listar or [])
+    m.encerrar_processos = lambda pids: (enc.append(list(pids)) or len(pids))
+    m.time = _NS(sleep=lambda s: None)
+    m.threading = _NS(Event=_thr.Event)
+    try:
+        r = m.App._fechar_para_atualizar(sv, {"nome": "Ollama", "id": "Ollama.Ollama"}, (lambda t: None), saida)
+    finally:
+        m.processos_com_arquivo = _orig_pca
+        m.listar_processos, m.encerrar_processos = _orig_lp, _orig_ep
+        m.time, m.threading = _orig_time, _orig_thr
+    return r, enc, sv.fila, chamadas
+
+r, enc, fila, chamadas = _sim_travador(_MARCA_PT + _log_mesma, resposta=True, travadores=[_TRAV_PY])
+ok(chamadas == [_DLL], "fechar travador: processos_com_arquivo chamado com o arquivo do log")
+ok(len(fila.perguntas) == 1 and "python.exe" in fila.perguntas[0] and "(PID 10)" in fila.perguntas[0],
+   "fechar travador: python.exe aparece na pergunta")
+ok(len(fila.perguntas) == 1 and r"python.exe C:\Users\Gian\openjarvis\main.py" in fila.perguntas[0],
+   "fechar travador: texto da pergunta contem a linha de comando do travador")
+ok(r is True and enc == [[10]], "fechar travador: resposta SIM -> encerra so o PID 10 e devolve True")
+r, enc, fila, chamadas = _sim_travador("", resposta=True, travadores=[_TRAV_PY])
+ok(chamadas == [] and fila.perguntas == [] and enc == [] and r is False,
+   "fechar travador: saida do winget vazia -> processos_com_arquivo NAO e chamado, sem pergunta")
+r, enc, fila, chamadas = _sim_travador(_MARCA_PT + _log_mesma, resposta=True, travadores=[], listar=[])
+ok(r is False and enc == [] and fila.perguntas == [],
+   "fechar travador: arquivo travado mas nenhum processo achado -> False")
+m.processos_com_arquivo = _orig_pca
+
+# --- versao do app, paginas oficiais (intel/oledb) e marcar_fora_do_winget com pagina
+import re as _re
+ok(_re.match(r"^\d+\.\d+\.\d+$", m.APP_VERSAO) is not None, "APP_VERSAO casa X.Y.Z")
+ok(m.pagina_download({"id": "Intel.IntelExtremeTuningUtility", "disponivel": "7.14.2.69"}).startswith("https://")
+   and m.pagina_download({"id": "Intel.IntelExtremeTuningUtility", "disponivel": "7"}) != "",
+   "pagina_download: Intel XTU devolve https:// nao vazio")
+ok(m.pagina_download({"id": "Microsoft.SQLServer.OLEDBDriver", "disponivel": "19"}).startswith("https://")
+   and m.pagina_download({"id": "MICROSOFT.SQLSERVER.OLEDBDRIVER", "disponivel": "19"}).startswith("https://"),
+   "pagina_download: OLE DB devolve https:// (id em qualquer caixa)")
+ok(m.pagina_download({"id": "Python.Python.3.13", "disponivel": "3.13.2"}) == "https://www.python.org/downloads/release/python-3132/",
+   "pagina_download: Python continua igual")
+ok(m.pagina_download({"id": "EclipseAdoptium.Temurin.21.JDK", "disponivel": "21"}) == "https://adoptium.net/temurin/releases/?version=21",
+   "pagina_download: Temurin continua igual")
+ok(m.pagina_download({"id": "Foo.Qualquer", "disponivel": "1.0"}) == "",
+   "pagina_download: id qualquer -> ''")
+_oledb = {"nome": "Microsoft OLE DB Driver", "id": "Microsoft.SQLServer.OLEDBDriver", "versao": "18", "disponivel": "19",
+          "status": "Atualizacao", "tag": "update", "tipo": "App", "acao": [["x"]], "marcado": False}
+m.marcar_fora_do_winget(_oledb)
+ok(str(_oledb.get("pagina", "")).startswith("https://"),
+   "marcar_fora_do_winget no OLE DB define item['pagina'] (https)")
 print()
 print("RESULTADO:", "TUDO OK" if not falhas else "%d falha(s): %s" % (len(falhas), falhas))

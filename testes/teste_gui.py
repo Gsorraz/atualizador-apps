@@ -658,6 +658,68 @@ chk(novo["acao"] is None and not novo["marcado"], "403: na proxima verificacao o
 app.lista, app.itens = [i for i in _lista_antes if i["iid"] != "i503"], {k: v for k, v in _itens_antes.items() if k != "i503"}
 app._redesenhar()
 
+# Ocultos ao carregar: linha no log (sem "Mostrar ignorados") e texto do resumo
+_ign_antes = app.var_mostrar_ign.get()
+_oc = {"nome": "Zeta Teste Oculto", "id": "Zeta.Oculto", "versao": "1", "disponivel": "2", "status": "Atualização",
+       "tag": "update", "tipo": "winget", "acao": [["x"]], "marcado": False}
+m.marcar_fora_do_winget(_oc)
+_msgs = []
+_log_orig = app._log
+app._log = lambda t: (_msgs.append(t), _log_orig(t))
+try:
+    app.var_mostrar_ign.set(False)
+    app._carregar_itens([dict(_oc)])
+    app._atualizar_resumo()
+    _txt = app.lb_status.cget("text")
+    chk(any("Ocultos da lista (1)" in t and "Zeta Teste Oculto" in t and "Mostrar ignorados" in t for t in _msgs),
+        "ocultos: sem 'Mostrar ignorados', o log lista o oculto e diz como ver")
+    chk("fora do winget" in _txt and "ligue \"Mostrar ignorados\"" in _txt,
+        "ocultos: resumo mostra 'fora do winget (ocultos: ligue \"Mostrar ignorados\")'")
+    _msgs.clear()
+    app.var_mostrar_ign.set(True)
+    app._carregar_itens([dict(_oc)])
+    chk(not any("Ocultos da lista" in t for t in _msgs),
+        "ocultos: com 'Mostrar ignorados' ligado, nao loga a linha de ocultos")
+finally:
+    app._log = _log_orig
+    app.var_mostrar_ign.set(_ign_antes)
+    app.lista, app.itens = [], {}
+    app._redesenhar()
+
+# Fora do winget (OLE DB, Intel XTU) e item "Em dia": linhas da tabela conforme "Mostrar ignorados"/"Mostrar em dia"
+_ok_antes, _ign_antes2 = app.var_mostrar_ok.get(), app.var_mostrar_ign.get()
+_lista_bkp, _itens_bkp = list(app.lista), dict(app.itens)
+def _fora(nome, id_):
+    return {"nome": nome, "id": id_, "versao": "1", "disponivel": "2", "status": "Fora do winget", "tag": "ok",
+            "tipo": "App", "acao": None, "marcado": False, "fora_winget": True}
+def _em_dia():
+    return {"nome": "Git Em Dia", "id": "Git.Git", "versao": "2", "disponivel": "2", "status": "Em dia", "tag": "ok",
+            "tipo": "App", "acao": None, "marcado": False, "fora_winget": False}
+def _nomes_na_tabela():
+    return {app.itens[i]["nome"] for i in app.tree.get_children() if i in app.itens}
+_conjunto = [_fora("Microsoft OLE DB Driver", "Microsoft.OLEDB"), _fora("Intel XTU", "Intel.XTU"), _em_dia()]
+try:
+    app.var_mostrar_ign.set(True); app.var_mostrar_ok.set(False)
+    app._carregar_itens([dict(i) for i in _conjunto])
+    n_on = _nomes_na_tabela()
+    chk({"Microsoft OLE DB Driver", "Intel XTU"} <= n_on and "Git Em Dia" not in n_on,
+        "fora do winget: com 'Mostrar ignorados' ON e 'Mostrar em dia' OFF, OLE DB e Intel XTU aparecem; Em dia continua escondido")
+    app.var_mostrar_ign.set(False); app.var_mostrar_ok.set(False)
+    app._carregar_itens([dict(i) for i in _conjunto])
+    n_off = _nomes_na_tabela()
+    chk(not ({"Microsoft OLE DB Driver", "Intel XTU", "Git Em Dia"} & n_off),
+        "fora do winget: com 'Mostrar ignorados' OFF nao aparecem linhas (nem Em dia)")
+    app.var_mostrar_ign.set(True); app.var_mostrar_ok.set(True)
+    app._carregar_itens([dict(i) for i in _conjunto])
+    chk({"Microsoft OLE DB Driver", "Intel XTU", "Git Em Dia"} <= _nomes_na_tabela(),
+        "fora do winget: com 'Mostrar em dia' ON, Em dia tambem aparece (controle)")
+finally:
+    app.var_mostrar_ok.set(_ok_antes); app.var_mostrar_ign.set(_ign_antes2)
+    app.lista, app.itens = _lista_bkp, _itens_bkp
+    app._redesenhar()
+
+# titulo da janela com a versao do app
+chk(root.title() == f"{m.APP_NOME} v{m.APP_VERSAO}", "janela: titulo contem o nome e a versao (vX.Y.Z)")
 liberou = []
 _lib = m.liberar_instancia
 m.liberar_instancia = lambda: (liberou.append(1), _lib())

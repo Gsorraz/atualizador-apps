@@ -43,6 +43,9 @@ import tkinter.font as tkfont
 from tkinter import ttk
 
 APP_NOME = "Atualizador de Apps"
+# Número da versão do executável: AUMENTAR a cada .exe novo (regra do projeto: nunca gerar dois .exe com o mesmo número).
+# Aparece no título da janela, no diagnostico.log, nas propriedades do .exe e em testes\logs\HISTORICO_VERSOES.md.
+APP_VERSAO = "1.0.1"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "AtualizadorApps")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -67,6 +70,10 @@ CODIGOS_WINGET = {
     0x8A150101: "o programa está aberto — feche e tente de novo",
     0x8A150102: "outra instalação em andamento — tente de novo depois",
     0x8A150109: "reinicie o computador para concluir",
+    # O instalador (ex.: Inno Setup do Ollama) não conseguiu trocar um arquivo que o programa aberto estava usando e,
+    # em modo silencioso, "cancela" sozinho e desfaz tudo. Não é o usuário que cancelou.
+    0x8A15010C: "o instalador cancelou sozinho, quase sempre porque o programa está aberto e travou um arquivo — "
+                "feche o programa (e o ícone dele na bandeja) e tente de novo",
     0xE0000001: "não consegui baixar o instalador oficial",
     0xE0000002: "o hash SHA-256 do arquivo baixado não confere (arquivo descartado, nada foi instalado)",
     0xE0000003: "a assinatura digital do arquivo não é a esperada (arquivo descartado, nada foi instalado)",
@@ -469,7 +476,47 @@ def comando_inicializacao() -> str:
     return f'"{exe}" "{os.path.abspath(__file__)}" --minimizado'
 
 
-def iniciar_com_windows_ativo() -> bool:
+def _xml_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def xml_tarefa_inicio(exe: str, argumentos: str, usuario: str) -> str:
+    """XML da tarefa 'ao entrar no Windows, com privilégios máximos'. É assim que um programa que EXIGE administrador
+    sobe sozinho no logon: a chave Run do registro é ignorada pelo Windows para programas elevados (e o UAC pediria
+    confirmação a cada boot). A tarefa roda elevada, sem UAC, já que foi criada uma vez por um processo administrador."""
+    u = _xml_escape(usuario)
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Atualizador de Apps: abre minimizado ao entrar no Windows, como administrador.</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{u}</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>{u}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{_xml_escape(exe)}</Command><Arguments>{_xml_escape(argumentos)}</Arguments></Exec></Actions>
+</Task>
+"""
+
+
+def _schtasks(args, timeout=30) -> int:
+    try:
+        return subprocess.run(["schtasks"] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              stdin=subprocess.DEVNULL, creationflags=NO_WINDOW, timeout=timeout).returncode
+    except Exception:
+        return -1
+
+
+def tarefa_inicio_existe() -> bool:
+    return _schtasks(["/Query", "/TN", RUN_NOME]) == 0
+
+
+def _run_key_tem() -> bool:
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as k:
@@ -479,7 +526,7 @@ def iniciar_com_windows_ativo() -> bool:
         return False
 
 
-def definir_iniciar_com_windows(ativo: bool) -> bool:
+def _run_key_definir(ativo: bool) -> bool:
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
@@ -493,6 +540,55 @@ def definir_iniciar_com_windows(ativo: bool) -> bool:
         return True
     except OSError:
         return False
+
+
+def _criar_tarefa_inicio() -> bool:
+    """Cria/atualiza a tarefa elevada. Só funciona com este processo como administrador."""
+    if not eh_admin() or not getattr(sys, "frozen", False):
+        return False
+    usuario = os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")
+    caminho = os.path.join(tempfile.gettempdir(), f"atualizador_tarefa_{os.getpid()}.xml")
+    try:
+        with open(caminho, "w", encoding="utf-16") as f:
+            f.write(xml_tarefa_inicio(sys.executable, "--minimizado", usuario))
+        ok = _schtasks(["/Create", "/TN", RUN_NOME, "/XML", caminho, "/F"]) == 0
+    except OSError:
+        ok = False
+    finally:
+        try:
+            os.remove(caminho)
+        except OSError:
+            pass
+    diag(f"tarefa de inicialização elevada: {'criada' if ok else 'FALHOU ao criar'}")
+    return ok
+
+
+def iniciar_com_windows_ativo() -> bool:
+    return tarefa_inicio_existe() or _run_key_tem()
+
+
+def definir_iniciar_com_windows(ativo: bool) -> bool:
+    if ativo:
+        if _criar_tarefa_inicio():
+            _run_key_definir(False)        # a tarefa substitui a chave Run (senão subiria duas vezes)
+            return True
+        return _run_key_definir(True)      # .py ou sem admin: o jeito antigo
+    ok = _run_key_definir(False)
+    if tarefa_inicio_existe():
+        ok = _schtasks(["/Delete", "/TN", RUN_NOME, "/F"]) == 0 and ok
+    return ok
+
+
+def migrar_inicio_para_tarefa():
+    """Quem já tinha 'Iniciar com o Windows' pela chave Run passa para a tarefa elevada (a chave Run não sobe um
+    programa que exige administrador). Roda uma vez por inicialização, em thread própria; nunca levanta erro."""
+    try:
+        if eh_admin() and getattr(sys, "frozen", False) and _run_key_tem() and not tarefa_inicio_existe():
+            if _criar_tarefa_inicio():
+                _run_key_definir(False)
+                diag("inicialização migrada da chave Run para a tarefa elevada")
+    except Exception as e:
+        diag(f"migração da inicialização falhou: {e!r}")
 
 
 # ----------------------------------------------------------------------------
@@ -1650,6 +1746,135 @@ def programas_abertos(itens):
     return achados
 
 
+_NUNCA_FECHAR = {"explorer", "svchost", "winlogon", "csrss", "services", "lsass", "system", "dwm", "winget", "cmd",
+                 "conhost", "powershell", "pwsh", "python", "pythonw", "atualizadorapps", "msiexec", "taskhostw"}
+
+
+def termos_do_item(item):
+    """Palavras do nome/ID do pacote que identificam os processos dele (mesma regra de programas_abertos)."""
+    ignorar = {"microsoft", "windows", "driver", "update", "runtime", "python", "node", "java", "openjs",
+               "eclipse", "adoptium", "setup", "installer", "desktop", "studio", "tools", "service", "version"}
+    partes = re.findall(r"[a-z0-9]{4,}", (str(item.get("nome") or "") + " " + str(item.get("id") or "")).lower())
+    return {p for p in partes if p not in ignorar and not p.isdigit()}
+
+
+def escolher_processos(lista, termos, meu_pid, meu_exe=""):
+    """Dos processos listados ({ProcessId, Name, ExecutablePath}), os que pertencem ao pacote: o nome (sem .exe) é o
+    termo ou começa com ele (termos de 6+ letras). Nunca devolve o próprio app, processo do Windows nem shell."""
+    achados = []
+    meu_exe = os.path.normcase(meu_exe or "")
+    win = os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows"))
+    for p in lista or []:
+        try:
+            pid = int(p.get("ProcessId"))
+            nome = re.sub(r"\.exe$", "", str(p.get("Name") or ""), flags=re.I).lower()
+            caminho = str(p.get("ExecutablePath") or "")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if pid == meu_pid or not nome or nome in _NUNCA_FECHAR or not caminho:
+            continue
+        if os.path.normcase(caminho) == meu_exe or os.path.normcase(caminho).startswith(win + os.sep):
+            continue
+        if any(nome == t or (len(t) >= 6 and nome.startswith(t)) for t in termos):
+            achados.append({"pid": pid, "nome": str(p.get("Name")), "caminho": caminho})
+    return achados
+
+
+def listar_processos():
+    """[{ProcessId, ParentProcessId, Name, ExecutablePath}] via PowerShell; [] se não conseguir."""
+    cmd = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; ConvertTo-Json -Compress -InputObject "
+           "@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath)")
+    saida = rodar(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd], timeout=40) or ""
+    i = saida.find("[")
+    if i < 0:
+        return []
+    try:
+        dados, _ = json.JSONDecoder().raw_decode(saida[i:])
+        return [d for d in dados if isinstance(d, dict)]
+    except ValueError:
+        return []
+
+
+_NUNCA_FECHAR_TRAVADOR = _NUNCA_FECHAR - {"python", "pythonw"}   # quem segura o arquivo de fato pode ser um script Python
+
+
+def arquivo_travado_no_log(saida_winget: str) -> str:
+    """Do texto do winget acha o log do instalador (Inno Setup) e dele o arquivo que não pôde ser trocado.
+    '' se não achar (outro tipo de instalador, log ilegível...)."""
+    m = re.search(r"(?:registro do instalador está disponível em|installer log is available at):\s*(.+?\.log)",
+                  saida_winget or "", re.I)
+    if not m:
+        return ""
+    try:
+        with open(m.group(1).strip(), "r", encoding="utf-8-sig", errors="replace") as f:
+            linhas = f.read().splitlines()
+    except OSError:
+        return ""
+    ultimo = ""
+    for i, l in enumerate(linhas):
+        d = re.search(r"Dest filename:\s*(.*)$", l)
+        if d:
+            ultimo = d.group(1).strip() or (linhas[i + 1].strip() if i + 1 < len(linhas) else "")
+        if "appears to be in use" in l or "parece estar em uso" in l:
+            return ultimo
+    return ""
+
+
+def processos_com_arquivo(caminho: str):
+    """Processos que têm `caminho` carregado (DLL) — quem de fato trava o arquivo. [{ProcessId, Name, ExecutablePath,
+    CommandLine}]; [] se não achar ou se o PowerShell falhar."""
+    if not caminho:
+        return []
+    ps = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; $f=$env:ATUALIZADOR_ARQUIVO; $r=@(); "
+          "Get-Process -ErrorAction SilentlyContinue | ForEach-Object { try { if ($_.Modules | Where-Object "
+          "{ $_.FileName -ieq $f }) { $c=(Get-CimInstance Win32_Process -Filter ('ProcessId='+$_.Id)).CommandLine; "
+          "$r += [pscustomobject]@{ProcessId=$_.Id;Name=($_.ProcessName+'.exe');ExecutablePath=$_.Path;CommandLine=$c} } } "
+          "catch {} }; ConvertTo-Json -Compress -InputObject @($r)")
+    env = dict(os.environ, ATUALIZADOR_ARQUIVO=caminho)
+    saida = rodar(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=90, env=env) or ""
+    i = saida.find("[")
+    if i < 0:
+        return []
+    try:
+        dados, _ = json.JSONDecoder().raw_decode(saida[i:])
+        return [d for d in dados if isinstance(d, dict)]
+    except ValueError:
+        return []
+
+
+def filtrar_travadores(lista, meu_pid):
+    """Entre os processos que seguram o arquivo, tira o próprio app e os do Windows/shell."""
+    win = os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows"))
+    achados = []
+    for p in lista or []:
+        try:
+            pid = int(p.get("ProcessId"))
+            nome = re.sub(r"\.exe$", "", str(p.get("Name") or ""), flags=re.I).lower()
+            caminho = str(p.get("ExecutablePath") or "")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if pid == meu_pid or not nome or nome in _NUNCA_FECHAR_TRAVADOR:
+            continue
+        if caminho and os.path.normcase(caminho).startswith(win + os.sep):
+            continue
+        achados.append({"pid": pid, "nome": str(p.get("Name")), "caminho": caminho,
+                        "linha": str(p.get("CommandLine") or "")})
+    return achados
+
+
+def encerrar_processos(pids):
+    """Encerra cada PID e os filhos dele (taskkill /F /T). Devolve quantos pedidos o Windows aceitou."""
+    ok = 0
+    for pid in pids:
+        try:
+            r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW, timeout=30)
+            ok += r.returncode == 0
+        except Exception:
+            pass
+    return ok
+
+
 def java_winget_id(vendor, major, home):
     v = vendor.lower()
     jre = not os.path.isfile(os.path.join(home, "bin", "javac.exe"))   # JDK tem javac; só-JRE não (o nome da pasta engana)
@@ -1766,6 +1991,12 @@ def pagina_do_winget(winget, pid):
 def pagina_download(item):
     """Página do fabricante para a versão do item (só é oferecida quando NÃO se achou instalador)."""
     pid = str(item.get("id", ""))
+    fixas = {   # programas que o winget lista mas não consegue instalar: página oficial para baixar à mão
+        "intel.intelextremetuningutility": "https://www.intel.com/content/www/us/en/download/17881/intel-extreme-tuning-utility-intel-xtu.html",
+        "microsoft.sqlserver.oledbdriver": "https://learn.microsoft.com/sql/connect/oledb/download-oledb-driver-for-sql-server",
+    }
+    if pid.lower() in fixas:
+        return fixas[pid.lower()]
     if pid.startswith("EclipseAdoptium.Temurin."):
         return "https://adoptium.net/temurin/releases/?version=%s" % pid.split(".")[2]
     m = re.match(r"Python\.Python\.(\d+\.\d+)$", pid)
@@ -2053,7 +2284,7 @@ def checar_java(winget, log):
 class App:
     def __init__(self, root, minimizado=False):
         self.root = root
-        root.title(APP_NOME)
+        root.title(f"{APP_NOME} v{APP_VERSAO}")
         self.fila = queue.Queue()
         self.lista = []
         self.itens = {}
@@ -2312,7 +2543,7 @@ class App:
             if self.var_avisos.get() and self.horarios and not self.ocupado:
                 h = horario_devido(agora, self.horarios, self.disparados)
                 if h and not (self.adiado_ate and agora < self.adiado_ate):
-                    self.disparados.add((datetime.date.today().isoformat(), h))
+                    self.disparados.add((agora.date().isoformat(), h))
                     self.verificar("agenda")
         except Exception as e:
             self._log(f"Agenda: erro ({e})")
@@ -2528,7 +2759,8 @@ class App:
             ign = self._oculto(item)
             if ign and not self.var_mostrar_ign.get():
                 continue
-            if item["tag"] == "ok" and not item.get("acao") and not self.var_mostrar_ok.get():
+            if item["tag"] == "ok" and not item.get("acao") and not self.var_mostrar_ok.get() \
+                    and not item.get("fora_winget"):   # os "fora do winget" têm tag "ok", mas são pendências: 'Mostrar ignorados' os mostra
                 continue
             imagem = self._caixas["on" if item["marcado"] else "off"] if item.get("acao") and not ign else ""
             tags = ["ign" if ign else item["tag"]]
@@ -2569,7 +2801,7 @@ class App:
                  f"{ok} runtime(s) em dia • {marc} marcado(s)")
         fora = sum(1 for i in self.lista if i.get("fora_winget") and chave_item(i) not in self.ignorados)
         if fora:
-            texto += f" • {fora} fora do winget (ocultos)"
+            texto += f" • {fora} fora do winget (ocultos: ligue \"Mostrar ignorados\")"
         if self.falhas:
             # uma falha na consulta nunca pode parecer "tudo em dia"
             texto += f"  •  ⚠ verificação incompleta ({self.falhas} falha(s))"
@@ -2803,6 +3035,9 @@ class App:
                         self._marcar_sem_efeito(*dado)
                     elif tipo == "pagina":
                         self._definir_pagina(*dado)
+                    elif tipo == "fechar_pergunta":
+                        # fora do laço da fila: o diálogo roda um laço aninhado e duplicaria o reagendamento
+                        self.root.after(0, self._perguntar_fechar, dado)
                     elif tipo == "falhas":
                         self.falhas = int(dado)
                     elif tipo == "itens":
@@ -2842,6 +3077,12 @@ class App:
                 and not self._oculto(item)
             self.lista.append(item)
             self.itens[item["iid"]] = item
+        ocultos = [i["nome"] for i in self.lista if self._oculto(i)]
+        if ocultos and not self.var_mostrar_ign.get():
+            # lista vazia com "N programa(s) com atualização" no log parecia erro: diz quais foram ocultados e por quê
+            self._log(f"Ocultos da lista ({len(ocultos)}): {', '.join(ocultos[:8])}"
+                      f"{' ...' if len(ocultos) > 8 else ''}. Ligue \"Mostrar ignorados\" para vê-los "
+                      "(são os ignorados, os de versão pulada e os que o winget não conseguiu instalar).")
         self._redesenhar()
 
     def _definir_pagina(self, chave, url):
@@ -3042,6 +3283,54 @@ class App:
             self._set_ocupado(False)
             self._log(f"Não consegui iniciar a atualização: {e}")
 
+    def _fechar_para_atualizar(self, item, log, saida_winget="") -> bool:
+        """Roda na thread da atualização. Acha os processos que travam a instalação (primeiro quem segura de fato o
+        arquivo citado no log do instalador; depois os que casam com o nome do programa), PERGUNTA na tela e, se
+        confirmado, os encerra à força. True = encerrou algo e vale tentar de novo."""
+        try:
+            procs = []
+            travado = arquivo_travado_no_log(saida_winget)
+            if travado:
+                log(f"Arquivo que o instalador não conseguiu trocar: {travado}")
+                procs = filtrar_travadores(processos_com_arquivo(travado), os.getpid())
+            vistos = {p["pid"] for p in procs}
+            procs += [p for p in escolher_processos(listar_processos(), termos_do_item(item), os.getpid(), sys.executable)
+                      if p["pid"] not in vistos]
+        except Exception as e:
+            log(f"Não consegui listar os processos: {e!r}")
+            return False
+        if not procs:
+            log("O instalador não conseguiu trocar um arquivo, mas não achei quem o está usando. Pode ser o antivírus; "
+                "tente reiniciar o computador e atualizar de novo.")
+            return False
+
+        def descricao(p):
+            extra = f" — {p['linha'][-90:]}" if p.get("linha") else ""
+            return f"• {p['nome']}  (PID {p['pid']}){extra}"
+        linhas = "\n".join(descricao(p) for p in procs[:12])
+        texto = (f"Para atualizar {item['nome']} é preciso fechar:\n{linhas}\n\n"
+                 "Eles serão encerrados à força, e o que não foi salvo neles se perde. Depois a atualização é tentada "
+                 "de novo (uma vez).")
+        evento, resposta = threading.Event(), []
+        self.fila.put(("fechar_pergunta", (texto, evento, resposta)))
+        if not evento.wait(300) or not resposta or not resposta[0]:
+            log("Você não autorizou fechar o programa; nada foi encerrado.")
+            return False
+        n = encerrar_processos([p["pid"] for p in procs])
+        diag(f"fechar_para_atualizar: {item['nome']}: {n}/{len(procs)} encerrados: "
+             f"{[(p['nome'], p['pid']) for p in procs]}")
+        log(f"Encerrado(s): {', '.join(p['nome'] for p in procs)}. Tentando atualizar de novo...")
+        time.sleep(3)    # deixa o Windows soltar os arquivos
+        return n > 0
+
+    def _perguntar_fechar(self, dado):
+        texto, evento, resposta = dado
+        try:
+            resposta.append(perguntar(self.root, "Fechar o programa para atualizar?", texto,
+                                      ok="Fechar e atualizar", cancelar="Não fechar"))
+        finally:
+            evento.set()
+
     def _tarefa_atualizar(self, escolhidos):
         log = lambda t: self.fila.put(("log", t))
         ok = falha = sem = 0
@@ -3050,13 +3339,26 @@ class App:
                 self.fila.put(("status", f"[{n}/{len(escolhidos)}] Atualizando {item['nome']}..."))
                 log(f"\n=== {item['nome']} ===")
                 sucesso, sem_efeito, detalhe = True, False, ""
+                tentou_fechar = False
                 try:
                     for cmd in item["acao"]:
                         log("> " + self._exibir_cmd(cmd))
                         # "@direto" = instalador oficial do fabricante (baixa, confere hash/assinatura e instala)
-                        code = instalar_direto(cmd, log) if cmd[0] == "@direto" else executar_streaming(cmd, log)
+                        saida_cmd = []        # saída desta execução (o caminho do log do instalador vem nela)
+
+                        def log_cmd(t, _s=saida_cmd):
+                            _s.append(t)
+                            log(t)
+                        code = instalar_direto(cmd, log) if cmd[0] == "@direto" else executar_streaming(cmd, log_cmd)
                         c32 = code & 0xFFFFFFFF
                         disp = str(item.get("disponivel", ""))
+                        if c32 == 0x8A15010C and cmd[0] != "@direto" and not tentou_fechar:
+                            # o programa aberto travou um arquivo: com a sua confirmação, fecha e tenta uma vez de novo
+                            tentou_fechar = True
+                            if self._fechar_para_atualizar(item, log, "\n".join(saida_cmd)):
+                                log("> " + self._exibir_cmd(cmd))
+                                code = executar_streaming(cmd, log)
+                                c32 = code & 0xFFFFFFFF
                         if c32 in CODIGOS_REINICIAR:
                             detalhe = "reinício pendente"
                             log("Instalado, mas o Windows pede para reiniciar o computador para concluir.")
@@ -3091,6 +3393,14 @@ class App:
                         if c32 not in CODIGOS_OK:
                             detalhe = descrever_codigo(code)
                             log(f"Falhou: {detalhe}")
+                            if c32 == 0x8A15010C and cmd[0] != "@direto":
+                                try:
+                                    abertos = programas_abertos([item])
+                                except Exception:
+                                    abertos = []
+                                if abertos:
+                                    log(f"Programa aberto agora: {', '.join(abertos)}. Feche-o (inclusive na bandeja do "
+                                        f"relógio, perto da hora) e clique em Atualizar de novo.")
                             sucesso = False
                             if falha_de_download_http(code) and cmd[0] != "@direto":
                                 # o servidor do fabricante recusou o download: só aí vale procurar a página dele
@@ -3125,7 +3435,7 @@ def main():
         return
     instalar_ganchos_de_erro()
     reabrindo = "--reabrir" in sys.argv[1:]   # veio do botão "Reabrir como admin": espera a cópia antiga fechar
-    diag(f"==== INÍCIO argv={sys.argv[1:]} frozen={getattr(sys, 'frozen', False)} exe={sys.executable} "
+    diag(f"==== INÍCIO v{APP_VERSAO} argv={sys.argv[1:]} frozen={getattr(sys, 'frozen', False)} exe={sys.executable} "
          f"cwd={os.getcwd()} admin={eh_admin()}")
     if outra_instancia_aberta(espera_s=15 if reabrindo else 0):
         diag("saindo: já existe outra cópia aberta")
@@ -3147,6 +3457,7 @@ def main():
     t0 = time.monotonic()
     App(root, minimizado="--minimizado" in sys.argv[1:])
     diag(f"interface pronta em {time.monotonic() - t0:.1f}s; entrando no laço principal")
+    threading.Thread(target=migrar_inicio_para_tarefa, daemon=True).start()
     root.mainloop()
     diag("==== FIM (laço principal encerrado normalmente)")
 

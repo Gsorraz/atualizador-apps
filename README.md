@@ -27,3 +27,6 @@ pyinstaller --onefile --windowed --name AtualizadorApps --icon app.ico --add-dat
 ## Testes
 `testes\rodar_testes.ps1` roda compilação, testes de lógica e de interface. Com um jogo aberto em tela cheia,
 ele pula os testes que abrem janela (resultado `PARCIAL`).
+
+## Versão atual
+**1.0.1**. O número fica em `APP_VERSAO` no código e aparece no título da janela e no log. Para gerar o `.exe`, rode `gerar_exe.ps1`: ele grava a versão nas propriedades do arquivo e recusa repetir um número já usado.
